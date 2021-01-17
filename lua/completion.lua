@@ -6,8 +6,8 @@ local signature = require'completion.signature_help'
 local hover = require'completion.hover'
 local opt = require'completion.option'
 local manager = require'completion.manager'
+local timr = require'completion.timer'
 local M = {}
-
 
 ------------------------------------------------------------------------
 --                          external commands                         --
@@ -23,10 +23,16 @@ end
 
 M.nextSource = function()
   source.nextCompletion()
+  if (manager.debounced) then
+    manager.debounced()
+  end
 end
 
 M.prevSource = function()
   source.prevCompletion()
+  if (manager.debounced) then
+    manager.debounced()
+  end
 end
 
 M.triggerCompletion = function()
@@ -152,14 +158,72 @@ end
 --                            autocommands                            --
 ------------------------------------------------------------------------
 
+local function onTimeout(opts)
+  local l_changedTick = api.nvim_buf_get_changedtick(0)
+  local l_complete_index = opts.l_complete_index
+
+  -- TODO: remove this
+  local autoChange = false
+  if opt.get_option('auto_change_source') == 1 then
+    autoChange = true
+  end
+
+
+  -- complete if changes are made
+  if l_changedTick ~= manager.changedTick then
+    manager.changedTick = l_changedTick
+    if opt.get_option('enable_auto_popup') == 1 then
+      source.autoCompletion()
+    end
+    if opt.get_option('enable_auto_hover') == 1 then
+      hover.autoOpenHoverInPopup(manager)
+    end
+    if opt.get_option('enable_auto_signature') == 1 then
+      signature.autoOpenSignatureHelp()
+    end
+  end
+
+  -- change source if no item is available
+  if manager.changeSource and autoChange then
+    manager.changeSource = false
+    if manager.chainIndex ~= source.chain_complete_length then
+      manager.chainIndex = manager.chainIndex + 1
+      l_complete_index = manager.chainIndex
+      manager.insertChar = true
+      source.triggerCompletion(false, manager)
+    else
+      source.stop_complete = true
+    end
+  end
+
+  -- force trigger completion when manually changing source
+  if l_complete_index ~= manager.chainIndex then
+    -- force clear completion
+    if vim.api.nvim_get_mode()['mode'] == 'i' or vim.api.nvim_get_mode()['mode'] == 'ic' then
+      vim.fn.complete(vim.api.nvim_win_get_cursor(0)[2], {})
+    end
+    source.triggerCompletion(false, manager)
+    opts.l_complete_index = manager.chainIndex
+    -- recur here to force update of Completion list
+    onTimeout(opts)
+  end
+end
+
+
 function M.on_InsertCharPre()
   manager.insertChar = true
   manager.textHover = true
   manager.selected = -1
+  manager.debounced()
 end
 
 function M.on_InsertLeave()
   manager.insertLeave = true
+
+  if (manager.debounced) then
+    manager.debounced.cancel()
+    manager.debounced = nil
+  end
 end
 
 -- TODO: need further refactor, very messy now:(
@@ -168,64 +232,22 @@ function M.on_InsertEnter()
   if enable == nil or enable == 0 then
     return
   end
-  local timer = vim.loop.new_timer()
   -- setup variable
   manager.init()
-
-  -- TODO: remove this
-  local autoChange = false
-  if opt.get_option('auto_change_source') == 1 then
-    autoChange = true
-  end
 
   -- reset source
   manager.chainIndex = 1
   source.stop_complete = false
-  local l_complete_index = manager.chainIndex
-  local timer_cycle = opt.get_option('timer_cycle')
 
-  timer:start(100, timer_cycle, vim.schedule_wrap(function()
-    local l_changedTick = api.nvim_buf_get_changedtick(0)
-    -- complete if changes are made
-    if l_changedTick ~= manager.changedTick then
-      manager.changedTick = l_changedTick
-      if opt.get_option('enable_auto_popup') == 1 then
-        source.autoCompletion()
-      end
-      if opt.get_option('enable_auto_hover') == 1 then
-        hover.autoOpenHoverInPopup(manager)
-      end
-      if opt.get_option('enable_auto_signature') == 1 then
-        signature.autoOpenSignatureHelp()
-      end
-    end
-    -- change source if no item is available
-    if manager.changeSource and autoChange then
-      manager.changeSource = false
-      if manager.chainIndex ~= source.chain_complete_length then
-        manager.chainIndex = manager.chainIndex + 1
-        l_complete_index = manager.chainIndex
-        manager.insertChar = true
-        source.triggerCompletion(false, manager)
-      else
-        source.stop_complete = true
-      end
-    end
-    -- force trigger completion when manaully chaging source
-    if l_complete_index ~= manager.chainIndex then
-      -- force clear completion
-      if vim.api.nvim_get_mode()['mode'] == 'i' or vim.api.nvim_get_mode()['mode'] == 'ic' then
-        vim.fn.complete(vim.api.nvim_win_get_cursor(0)[2], {})
-      end
-      source.triggerCompletion(false, manager)
-      l_complete_index = manager.chainIndex
-    end
-    -- closing timer if leaving insert mode
-    if manager.insertLeave == true and timer:is_closing() == false then
-      timer:stop()
-      timer:close()
-    end
-  end))
+  --clear if debounced already exists
+  if (manager.debounced) then
+    manager.debounced.cancel()
+    manager.debounced = nil
+  end
+
+  local timer_cycle = opt.get_option('timer_cycle') or 250
+  local l_complete_index = manager.chainIndex
+  manager.debounced = timr.debounce(timer_cycle, onTimeout, {}, { l_complete_index = l_complete_index })
 end
 
 -- handle completion confirmation and dismiss hover popup
